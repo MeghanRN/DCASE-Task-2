@@ -1,0 +1,5 @@
+# ignore all audio datasets
+data/dcase2025t2/
+outputs/
+pretrained/
+results/
