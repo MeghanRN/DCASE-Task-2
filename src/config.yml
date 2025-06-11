@@ -12,7 +12,7 @@ audio:
 train:
   batch_size: 64
   lr:         0.001
-  epochs:     20   # you can bump back to 100 once it’s working
+  epochs:     1 
 
 threshold:
   percentile: 90
