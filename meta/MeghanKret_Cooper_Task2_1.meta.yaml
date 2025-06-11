@@ -1,0 +1,39 @@
+# --------------------------------------------------------------
+# Submission information
+# --------------------------------------------------------------
+submission:
+  label: MeghanKret_Cooper_task2_1
+  name: Dev-Pretrain + Fine-Tune AE
+  abbreviation: AE-PTFT
+  authors:
+    - firstname: Meghan
+      lastname: Kret
+      email: meghan.notkin@cooper.edu
+      corresponding: true
+      affiliation:
+        institution: The Cooper Union
+        department: Albert Nerkin School of Engineering, Electrical Engineering
+        location: New York, USA
+
+# --------------------------------------------------------------
+# System description 
+# --------------------------------------------------------------
+system:
+  description:
+    input_sampling_rate: 16kHz
+    acoustic_features: log-mel energies
+    machine_learning_method: AE
+    aggregation_method: average
+    domain_adaptation_method: fine-tuning
+    domain_generalization_method: pre-training
+    development_data_usage: pre-training
+  complexity:
+    total_parameters: !!null
+    MACS: !!null
+  external_datasets: []
+  source_code: https://github.com/MeghanRN/DCASE-Task-2
+
+# --------------------------------------------------------------
+# Results section 
+# --------------------------------------------------------------
+results: {}
