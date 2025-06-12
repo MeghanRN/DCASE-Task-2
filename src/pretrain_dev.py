@@ -14,17 +14,23 @@ AUDIO, TRAIN = cfg["audio"], cfg["train"]
 # -------- dataset -------------------------------------------------
 class DevWindows(IterableDataset):
     def __init__(self, root):
+        # collect all .wav paths under each machine’s train directory
         self.wavs = glob.glob(f"{root}/*/train/*.wav")
 
     def __iter__(self):
         for wf in self.wavs:
-            y, sr = ut.librosa.load(wf, sr=AUDIO["sample_rate"])
-            M = ut.extract_logmel(y, sr,
-                                  AUDIO["n_fft"],
-                                  AUDIO["hop_length"],
-                                  AUDIO["n_mels"])
+            # Let extract_logmel load & preprocess the file itself
+            M = ut.extract_logmel(
+                wf,                         # filepath
+                sr=AUDIO["sample_rate"],    # use your sample_rate constant
+                n_fft=AUDIO["n_fft"],
+                hop_length=AUDIO["hop_length"],
+                n_mels=AUDIO["n_mels"]
+            )
+            # break spectrogram into context windows
             for w in ut.make_windows(M, AUDIO["context"]):
                 yield torch.from_numpy(w)
+
 
 # -------- model ---------------------------------------------------
 class AE(nn.Module):
