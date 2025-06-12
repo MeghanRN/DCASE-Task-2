@@ -7,14 +7,12 @@ fallback to the DEV train normals if no ADD‑TRAIN exists), run inference on th
 DEV test clips, compute AUC / pAUC / PRF metrics, and print a ready‑to‑paste
 YAML snippet for the meta file.
 
-Key changes
-~~~~~~~~~~~
-* **Empty‑directory guard** – if no WAVs are found in `eval_root/<machine>/train`,
-  the script automatically falls back to `dev_root/<machine>/train`. If that is
-  also empty, the machine is skipped with a warning rather than crashing.
-* All tensors are cast to `float32`.
-* CSV headers added.
-* Threshold percentile key fallback (`train.gamma_percentile` ➔ `threshold.percentile`).
+Key features
+~~~~~~~~~~~~
+* Skips machines gracefully when no training or test data exist.
+* Guards against Float↔Double dtype mismatches.
+* Robust percentile threshold with fallback to `threshold.percentile`.
+* CSVs include headers for easier ad‑hoc inspection.
 """
 
 from __future__ import annotations
@@ -30,14 +28,18 @@ from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from sklearn.metrics import roc_auc_score, roc_curve, precision_recall_fscore_support
+from sklearn.metrics import (
+    roc_auc_score,
+    roc_curve,
+    precision_recall_fscore_support,
+)
 from scipy.stats import gamma
 
 from utils import extract_logmel, make_windows
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 # Model definition
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 
 
 class AE(nn.Module):
@@ -60,9 +62,9 @@ class AE(nn.Module):
         return self.dec(self.enc(x))
 
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 # Utility helpers
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 
 def load_cfg(path: str = "config.yaml") -> dict:
     return yaml.safe_load(open(path, "r"))
@@ -100,9 +102,9 @@ def gamma_threshold(errors: np.ndarray, percentile: float) -> float:
     return float(gamma.ppf(percentile / 100.0, shape, loc=loc, scale=scale))
 
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 # Main pipeline
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 
 def main() -> None:
     cfg = load_cfg()
@@ -114,7 +116,8 @@ def main() -> None:
 
     dev_root = pathlib.Path(cfg["paths"]["dev_root"])
     eval_root = pathlib.Path(cfg["paths"]["eval_root"])
-    out_root = pathlib.Path("dev_results"); out_root.mkdir(parents=True, exist_ok=True)
+    out_root = pathlib.Path("dev_results")
+    out_root.mkdir(parents=True, exist_ok=True)
 
     # ── pretrained weights ──────────────────────────────────────────────
     weights_path = pathlib.Path(cfg["paths"]["pretrained_dir"]) / "ae_dev.pt"
@@ -219,32 +222,4 @@ def main() -> None:
             m = domains_np == dom
             if not m.any() or y_true_np[m].sum() == 0:
                 return float("nan")
-            return roc_auc_score(y_true_np[m], y_score_np[m]) * 100
-
-        auc_src = auc_for("source")
-        auc_tgt = auc_for("target")
-
-        fpr, tpr, _ = roc_curve(y_true_np, y_score_np)
-        mask = fpr <= 0.1
-        pauc = np.trapz(tpr[mask], fpr[mask]) / 0.1 * 100
-
-        y_pred = (y_score_np > thr).astype(int)
-        prec, rec, f1, _ = precision_recall_fscore_support(y_true_np, y_pred, pos_label=1, average="binary")
-
-        def prf(dom: str):
-            m = domains_np == dom
-            return precision_recall_fscore_support(y_true_np[m], y_pred[m], pos_label=1, average="binary", zero_division=0)
-
-        pr_src = prf("source")
-        pr_tgt = prf("target")
-
-        # ---------------- YAML lines -------------------------
-        yaml_lines.extend([
-            f"    {machine}:",
-            f"      auc_source: {auc_src:.2f}",
-            f"      auc_target: {auc_tgt:.2f}",
-            f"      pauc: {pauc:.2f}",
-            f"      precision_source: {pr_src[0]:.3f}",
-            f"      precision_target: {pr_tgt[0]:.3f}",
-            f"      recall_source: {pr_src[1]:.3f}",
-            f"      recall_target:
+            return roc_auc_score(y_true_np[m], y_score_np
