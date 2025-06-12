@@ -1,99 +1,126 @@
 #!/usr/bin/env python3
-import os, glob, yaml, numpy as np, torch
-from torch.utils.data import IterableDataset, DataLoader
+# ------------------------------------------------------------
+# pretrain_dev.py
+# Pre-trains an AE on *all normal* dev-set windows and
+# stores the weights + reconstruction-error histogram +
+# a Gamma-percentile threshold.
+# ------------------------------------------------------------
+import os, glob, yaml, pathlib, numpy as np, torch
 import torch.nn as nn
+from torch.utils.data import DataLoader, IterableDataset
 from tqdm import tqdm
-from utils import load_config, extract_logmel, make_windows, fit_gamma_threshold
+from utils import extract_logmel, make_windows, fit_gamma_threshold   # your utils.py
 
-class DevIterableDataset(IterableDataset):
+# ----------------- config helpers ---------------------------
+def load_cfg(path="config.yaml"):
+    return yaml.safe_load(open(path, "r"))
+
+def get_device(cfg):
+    if cfg.get("device", "auto") == "auto":
+        return torch.device("cuda" if torch.cuda.is_available()
+                            else "mps" if torch.backends.mps.is_available()
+                            else "cpu")
+    return torch.device(cfg["device"])
+
+# ----------------- dataset ----------------------------------
+class DevWindows(IterableDataset):
+    """
+    Streams *all* context-windows (640-D) from every
+    <machine>/train/*.wav in dev_root.
+    """
     def __init__(self, dev_root, cfg):
-        self.machine_dirs = [os.path.join(dev_root, m, "train")
-                             for m in os.listdir(dev_root)]
-        self.cfg = cfg
+        self.wavs = glob.glob(f"{dev_root}/*/train/*.wav")
+        self.cfg  = cfg
 
     def __iter__(self):
-        for mdir in self.machine_dirs:
-            for wav in glob.glob(os.path.join(mdir, "*.wav")):
-                logmel = extract_logmel(
-                    wav,
-                    sr=self.cfg["audio"]["sample_rate"],
-                    n_fft=self.cfg["audio"]["n_fft"],
-                    hop_length=self.cfg["audio"]["hop_length"],
-                    n_mels=self.cfg["audio"]["n_mels"]
-                )
-                windows = make_windows(logmel, self.cfg["audio"]["context"])
-                for w in windows:
-                    yield torch.from_numpy(w).float()
+        for wav_f in self.wavs:
+            y, sr = _read_wav(wav_f)
+            M = extract_logmel(
+                    y, sr,
+                    n_fft      = self.cfg["feature"]["n_fft"],
+                    hop_length = self.cfg["feature"]["hop_length"],
+                    n_mels     = self.cfg["feature"]["n_mels"])
+            W = make_windows(M, self.cfg["feature"]["context"])
+            for w in W:
+                yield torch.from_numpy(w).float()
 
+def _read_wav(path):
+    import scipy.io.wavfile as wav
+    sr, y = wav.read(path)
+    return (y.astype(np.float32)/32768.0, sr)
+
+# ----------------- model ------------------------------------
 class AutoEncoder(nn.Module):
-    def __init__(self, D, h=[128,64], b=8):
+    def __init__(self, D, h=128, b=8):
         super().__init__()
-        dims = [D] + h + [b]
-        self.enc = nn.Sequential(*[
-            nn.Sequential(nn.Linear(dims[i], dims[i+1]),
-                          nn.BatchNorm1d(dims[i+1]), nn.ReLU())
-            for i in range(len(dims)-1)
-        ])
-        dims2 = [b] + h[::-1] + [D]
-        self.dec = nn.Sequential(*[
-            nn.Sequential(nn.Linear(dims2[i], dims2[i+1]),
-                          nn.BatchNorm1d(dims2[i+1]),
-                          nn.ReLU() if i < len(dims2)-2 else nn.Identity())
-            for i in range(len(dims2)-1)
-        ])
+        self.net = nn.Sequential(
+            nn.Linear(D, h), nn.BatchNorm1d(h), nn.ReLU(),
+            nn.Linear(h, h), nn.BatchNorm1d(h), nn.ReLU(),
+            nn.Linear(h, h), nn.BatchNorm1d(h), nn.ReLU(),
+            nn.Linear(h, b), nn.BatchNorm1d(b), nn.ReLU(),
+            nn.Linear(b, h), nn.BatchNorm1d(h), nn.ReLU(),
+            nn.Linear(h, h), nn.BatchNorm1d(h), nn.ReLU(),
+            nn.Linear(h, h), nn.BatchNorm1d(h), nn.ReLU(),
+            nn.Linear(h, D)
+        )
+    def forward(self, x): return self.net(x)
 
-    def forward(self, x):
-        return self.dec(self.enc(x))
-
+# ----------------- main -------------------------------------
 def main():
-    cfg = load_config()
-    DEV_ROOT = cfg["data"]["dev_dir"]
-    os.makedirs("pretrained", exist_ok=True)
+    cfg      = load_cfg()
+    dev_root = cfg["paths"]["dev_root"]     # <-- SAME KEY AS finetune_and_infer.py
+    out_dir  = pathlib.Path(cfg["paths"]["pretrained_dir"])
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    # dataset & loader
-    ds = DevIterableDataset(DEV_ROOT, cfg)
-    loader = DataLoader(ds,
-                        batch_size=cfg["train"]["batch_size"],
-                        shuffle=False,
-                        num_workers=2)
+    D = cfg["feature"]["n_mels"] * cfg["feature"]["context"]
+    device = get_device(cfg)
+    print("Device:", device)
 
-    device = torch.device("mps" if torch.backends.mps.is_available()
-                          else ("cuda" if torch.cuda.is_available() else "cpu"))
-    D = cfg["audio"]["n_mels"] * cfg["audio"]["context"]
-    model = AutoEncoder(D).to(device)
+    # dataset & loader -------------------------------------------------
+    ds      = DevWindows(dev_root, cfg)
+    loader  = DataLoader(ds,
+                         batch_size = cfg["train"]["batch_size"],
+                         shuffle    = False,
+                         num_workers=2)
+    ae      = AutoEncoder(D,
+                          h = cfg["model"]["hidden"],
+                          b = cfg["model"]["bottleneck"]).to(device)
+    opt     = torch.optim.Adam(ae.parameters(), lr=cfg["train"]["lr"])
+    mse     = nn.MSELoss()
 
-    opt = torch.optim.Adam(model.parameters(), lr=cfg["train"]["lr"])
-    loss_fn = nn.MSELoss()
-
-    print("Pre-training on development data...")
-    for ep in range(cfg["train"]["epochs"]):
-        model.train()
-        bar = tqdm(loader, desc=f"Pretrain Epoch {ep+1}")
+    # training ---------------------------------------------------------
+    n_epochs = cfg["train"]["epochs_pretrain"]
+    print(f"Pre-training for {n_epochs} epoch(s) …")
+    for ep in range(n_epochs):
+        bar = tqdm(loader, desc=f"Epoch {ep+1}/{n_epochs}")
         for batch in bar:
             batch = batch.to(device)
-            pred = model(batch)
-            loss = loss_fn(pred, batch)
-            opt.zero_grad(); loss.backward(); opt.step()
+            opt.zero_grad()
+            loss = mse(ae(batch), batch)
+            loss.backward()
+            opt.step()
             bar.set_postfix(loss=loss.item())
 
-    # compute errors & threshold
-    model.eval()
+    # collect reconstruction errors -----------------------------------
+    print("Collecting reconstruction errors …")
     errs = []
+    ae.eval()
     with torch.no_grad():
-        for batch in DataLoader(ds,
-                    batch_size=cfg["train"]["batch_size"],
-                    num_workers=2):
+        for batch in loader:
             batch = batch.to(device)
-            errs.append(torch.mean((model(batch)-batch)**2, dim=1).cpu().numpy())
+            e = torch.mean((ae(batch)-batch)**2, dim=1).cpu().numpy()
+            errs.append(e)
     errs = np.concatenate(errs)
-    thr = fit_gamma_threshold(errs, cfg["threshold"]["percentile"])
 
-    # save
-    torch.save(model.state_dict(), "pretrained/pretrained_dev.pth")
-    np.save("pretrained/pretrained_dev_errors.npy", errs)
-    with open("pretrained/pretrained_dev_threshold.txt", "w") as f:
-        f.write(str(thr))
-    print(f"Saved pre-train model + threshold={thr:.6f}")
+    thr = fit_gamma_threshold(errs, cfg["threshold"]["percentile"])
+    print(f"Gamma {cfg['threshold']['percentile']}-th percentile threshold = {thr:.6f}")
+
+    # save -------------------------------------------------------------
+    torch.save(ae.state_dict(), out_dir / "ae_dev.pt")
+    np.save(out_dir / "dev_errors.npy", errs)
+    with open(out_dir / "threshold.txt", "w") as f:
+        f.write(f"{thr:.9f}")
+    print("✔  Saved weights + errors + threshold to", out_dir)
 
 if __name__ == "__main__":
     main()
