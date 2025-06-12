@@ -1,37 +1,40 @@
-# ------------------------------------------
-# Global paths
-# ------------------------------------------
+# ────────────────────────────────────────────────────────────────
+#  Global configuration – shared by pretrain_dev.py & finetune_and_infer.py
+# ────────────────────────────────────────────────────────────────
+
 paths:
+  # development-set normals (7 classical dev machines)
   dev_root:  data/dcase2025t2/dev_data/raw
+
+  # additional-train (normals)  +  evaluation-test (unknown labels)
+  # directory layout:  eval_data/raw/<machine>/{train,test}
   eval_root: data/dcase2025t2/eval_data/raw
-  out_root:  outputs/task2/Kret_CU_task2_1      # <— change label here
-  pretrained_dir: outputs/task2/pretrained      # holds dev pre-train weights
 
-# ------------------------------------------
-# Feature extraction
-# ------------------------------------------
-feature:
-  sr:            16000
-  n_mels:        128
-  win_length_ms: 64
-  hop_length_ms: 32
-  context:       5          # frames to stack (P)
+  # where the dev pre-trained AE weights are cached
+  pretrained_dir: outputs/pretrained
 
-# ------------------------------------------
-# Model
-# ------------------------------------------
+  # where fine-tune & inference CSVs are written
+  out_root: outputs/task2/MeghanKret_Cooper_task2_1
+
+audio:
+  sample_rate: 16000   # Hz
+  n_fft:       1024
+  hop_length:  512
+  n_mels:      128
+  context:     5       # frames concatenated → 128×5 = 640-D input
+
 model:
-  hidden: 128
-  bottleneck: 8
+  hidden:     128      # size of each hidden FC layer
+  bottleneck: 8        # size of latent vector
 
-# ------------------------------------------
-# Train / fine-tune
-# ------------------------------------------
 train:
-  epochs_pretrain: 30
-  epochs_finetune: 20
-  batch_size:      256
-  lr:              0.001
-  gamma_percentile: 0.90      # threshold
+  # ─── phase-1  (dev pre-train) ────────────────────────────────
+  epochs_pretrain:  100      # raise for final run; 1-5 for quick smoke test
+  # ─── phase-2  (machine-specific fine-tune) ───────────────────
+  epochs_finetune:  20       # ditto
+  # ─── shared  ─────────────────────────────────────────────────
+  batch_size:       64
+  lr:               0.001
+  gamma_percentile: 0.90     # threshold = 90-th pct of gamma-fit MSEs
 
-device: auto                     # "auto"=cuda|mps|cpu
+device: auto                  # "auto", "cuda", "mps", or "cpu"
