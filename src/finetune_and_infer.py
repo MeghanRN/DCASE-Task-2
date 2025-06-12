@@ -1,163 +1,114 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # ------------------------------------------------------------
-# finetune_and_infer.py
-# Fine-tunes on additional-train normals and infers on eval-test.
-# Writes CSVs + decision CSVs, builds DCASE submission ZIP.
+# Fine-tune per eval-machine + inference + package submission
 # ------------------------------------------------------------
-import os, yaml, glob, zipfile, shutil, pathlib
-import numpy as np
-import torch, torch.nn as nn, torch.optim as optim
+import os, glob, yaml, zipfile, pathlib, shutil, numpy as np, torch
+import torch.nn as nn, torch.optim as optim
 import scipy.io.wavfile as wav
 from tqdm import tqdm
-from datetime import datetime
-from utils import extract_logmel, make_windows  # from your existing utils
+import utils as ut
 
-# --------------- simple AE -----------------
-class AutoEncoder(nn.Module):
-    def __init__(self, D, h=128, bottleneck=8):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(D, h), nn.BatchNorm1d(h), nn.ReLU(),
-            nn.Linear(h, h), nn.BatchNorm1d(h), nn.ReLU(),
-            nn.Linear(h, h), nn.BatchNorm1d(h), nn.ReLU(),
-            nn.Linear(h, bottleneck), nn.BatchNorm1d(bottleneck), nn.ReLU(),
-            nn.Linear(bottleneck, h), nn.BatchNorm1d(h), nn.ReLU(),
-            nn.Linear(h, h), nn.BatchNorm1d(h), nn.ReLU(),
-            nn.Linear(h, h), nn.BatchNorm1d(h), nn.ReLU(),
-            nn.Linear(h, D)
-        )
-    def forward(self, x): return self.net(x)
+cfg  = ut.load_config()
+AUDIO, TRAIN = cfg["audio"], cfg["train"]
+D = AUDIO["n_mels"] * AUDIO["context"]
 
-# --------------- helpers -------------------
-def load_cfg():
-    return yaml.safe_load(open("config.yaml","r"))
-
-def device_from_cfg(cfg):
-    if cfg["device"]=="auto":
-        return torch.device("cuda" if torch.cuda.is_available()
-                            else "mps" if torch.backends.mps.is_available()
-                            else "cpu")
-    return torch.device(cfg["device"])
-
+# ------------ helper -------------------
 def gamma_threshold(errs, p):
-    from scipy.stats import gamma
-    shape, loc, scale = gamma.fit(errs, floc=0)
-    return gamma.ppf(p, shape, loc=loc, scale=scale)
+    import scipy.stats as st
+    shape, loc, scale = st.gamma.fit(errs, floc=0)
+    return st.gamma.ppf(p, shape, loc=loc, scale=scale)
 
-def dataset_windows(wav_files, cfg):
-    xs = []
+def dataset_windows(wav_files):
+    xs=[]
     for wf in wav_files:
-        sr, y = wav.read(wf); y = y.astype(np.float32)/32768
-        M = extract_logmel(y, sr, cfg)
-        xs.append(make_windows(M, cfg))
+        sr,y = wav.read(wf); y=y.astype(np.float32)/32768
+        M    = ut.extract_logmel(y, sr,
+                                 AUDIO["n_fft"],
+                                 AUDIO["hop_length"],
+                                 AUDIO["n_mels"])
+        xs.append(ut.make_windows(M, AUDIO["context"]))
     return np.concatenate(xs,0)
 
-# --------------- main ----------------------
+# ------------ model --------------------
+class AE(nn.Module):
+    def __init__(self, D, H=cfg["model"]["hidden"], B=cfg["model"]["bottleneck"]):
+        super().__init__()
+        self.enc = nn.Sequential(
+            nn.Linear(D,H), nn.BatchNorm1d(H), nn.ReLU(),
+            nn.Linear(H,H), nn.BatchNorm1d(H), nn.ReLU(),
+            nn.Linear(H,B), nn.BatchNorm1d(B), nn.ReLU())
+        self.dec = nn.Sequential(
+            nn.Linear(B,H), nn.BatchNorm1d(H), nn.ReLU(),
+            nn.Linear(H,H), nn.BatchNorm1d(H), nn.ReLU(),
+            nn.Linear(H,D))
+    def forward(self,x): return self.dec(self.enc(x))
+
+# ------------ main ---------------------
 def main():
-    cfg  = load_cfg()
-    dev  = cfg["paths"]["dev_root"]
-    eva  = cfg["paths"]["eval_root"]
-    out_root = cfg["paths"]["out_root"]
-    os.makedirs(out_root, exist_ok=True)
-    D = cfg["feature"]["n_mels"]*cfg["feature"]["context"]
-    dev_pretrain_weights = os.path.join(cfg["paths"]["pretrained_dir"], "ae_dev.pt")
+    dev_root  = cfg["paths"]["dev_root"]
+    eval_root = cfg["paths"]["eval_root"]
+    out_root  = pathlib.Path(cfg["paths"]["out_root"])
+    out_root.mkdir(parents=True, exist_ok=True)
 
-    device = device_from_cfg(cfg)
-    print("Using device:", device)
+    # device
+    device = (torch.device("cuda") if torch.cuda.is_available()
+              else torch.device("mps") if torch.backends.mps.is_available()
+              else torch.device("cpu"))
+    print("Device:", device)
 
-    # -------------------------------------------------
-    # 1) (Optional) pre-train on dev normals once
-    # -------------------------------------------------
-    if not os.path.exists(dev_pretrain_weights):
-        print("Pre-training on dev normals …")
-        wavs = glob.glob(f"{dev}/*/train/**/*.wav", recursive=True)
-        X = dataset_windows(wavs, cfg)
-        loader = torch.utils.data.DataLoader(
-            torch.from_numpy(X), batch_size=cfg["train"]["batch_size"], shuffle=True)
-        ae = AutoEncoder(D, cfg["model"]["hidden"], cfg["model"]["bottleneck"]).to(device)
-        opt = optim.Adam(ae.parameters(), lr=cfg["train"]["lr"])
-        for ep in range(cfg["train"]["epochs_pretrain"]):
-            pbar = tqdm(loader, desc=f"Pre-train {ep+1}/{cfg['train']['epochs_pretrain']}")
-            for batch in pbar:
-                batch = batch.to(device)
-                opt.zero_grad()
-                loss = ((ae(batch)-batch)**2).mean()
-                loss.backward(); opt.step()
-                pbar.set_postfix(loss=loss.item())
-        os.makedirs(os.path.dirname(dev_pretrain_weights), exist_ok=True)
-        torch.save(ae.state_dict(), dev_pretrain_weights)
-        print("Saved", dev_pretrain_weights)
-    else:
-        print("Found", dev_pretrain_weights)
+    # ---- load / create dev-pretrain weights --------------
+    w_pre = pathlib.Path(cfg["paths"]["pretrained_dir"])/"ae_dev.pt"
+    if not w_pre.exists():
+        raise RuntimeError("Pre-train weights missing. Run pretrain_dev.py first!")
 
-    # -------------------------------------------------
-    # 2) Fine-tune per machine + infer
-    # -------------------------------------------------
-    label = pathlib.Path(out_root).name    # used for submission dir
-    for machine in sorted(os.listdir(eva)):
-        m_root = os.path.join(eva, machine)
+    # ---- iterate over machines ---------------------------
+    for machine in sorted(os.listdir(eval_root)):
+        mdir = pathlib.Path(eval_root)/machine
         print(f"\n=== {machine} ===")
-        ae = AutoEncoder(D, cfg["model"]["hidden"], cfg["model"]["bottleneck"]).to(device)
-        ae.load_state_dict(torch.load(dev_pretrain_weights, map_location=device))
+        ae = AE(D).to(device)
+        ae.load_state_dict(torch.load(w_pre, map_location=device))
 
-        # ---- fine-tune ----------------------------------
-        train_wavs = glob.glob(f"{m_root}/train/**/*.wav", recursive=True)
-        X = dataset_windows(train_wavs, cfg)
+        # ---- fine-tune -----------------------------------
+        train_wavs = glob.glob(str(mdir/"train/**/*.wav"), recursive=True)
+        X = dataset_windows(train_wavs)
         loader = torch.utils.data.DataLoader(torch.from_numpy(X),
-                    batch_size=cfg["train"]["batch_size"], shuffle=True)
-        opt = optim.Adam(ae.parameters(), lr=cfg["train"]["lr"])
+                    batch_size=TRAIN["batch_size"], shuffle=True)
+        opt = optim.Adam(ae.parameters(), lr=TRAIN["lr"])
         ae.train()
-        for ep in range(cfg["train"]["epochs_finetune"]):
-            pbar=tqdm(loader, desc=f"Fine-tune {machine} {ep+1}/{cfg['train']['epochs_finetune']}")
-            for batch in pbar:
-                batch=batch.to(device); opt.zero_grad()
-                loss=((ae(batch)-batch)**2).mean()
-                loss.backward(); opt.step(); pbar.set_postfix(loss=loss.item())
+        for ep in range(TRAIN["epochs_finetune"]):
+            bar=tqdm(loader, desc=f"FT {machine} {ep+1}/{TRAIN['epochs_finetune']}")
+            for b in bar:
+                b=b.to(device); loss=((ae(b)-b)**2).mean()
+                opt.zero_grad(); loss.backward(); opt.step()
+                bar.set_postfix(loss=f"{loss.item():.4f}")
 
-        # determine threshold
+        # ---- threshold from fine-tune data ---------------
         with torch.no_grad():
             errs=[]
-            for batch in loader:
-                batch=batch.to(device)
-                e=((ae(batch)-batch)**2).mean(1).cpu().numpy()
-                errs.append(e)
-        errs=np.concatenate(errs)
-        thr=gamma_threshold(errs, cfg["train"]["gamma_percentile"])
-        print(f"  threshold={thr:.3f}")
+            for b in loader:
+                b=b.to(device)
+                errs.append(((ae(b)-b)**2).mean(1).cpu().numpy())
+            thr = gamma_threshold(np.concatenate(errs), TRAIN["gamma_percentile"])
+        print(f"threshold={thr:.3f}")
 
-        # ---- inference ----------------------------------
-        test_wavs=sorted(glob.glob(f"{m_root}/test/*.wav"))
-        score_csv  = os.path.join(out_root,
-                       f"anomaly_score_{machine}_section_00_test.csv")
-        decision_csv=os.path.join(out_root,
-                       f"decision_result_{machine}_section_00_test.csv")
-        with open(score_csv,"w") as sf, open(decision_csv,"w") as df:
+        # ---- inference on eval-test ----------------------
+        test_wavs = sorted(glob.glob(str(mdir/"test/*.wav")))
+        score_csv    = out_root/f"anomaly_score_{machine}_section_00_test.csv"
+        decision_csv = out_root/f"decision_result_{machine}_section_00_test.csv"
+        with score_csv.open("w") as sf, decision_csv.open("w") as df:
             for wf in tqdm(test_wavs, desc="Infer"):
-                sr,y=wav.read(wf); y=y.astype(np.float32)/32768
-                M=extract_logmel(y,sr,cfg)
-                W=make_windows(M,cfg)
+                sr,y = wav.read(wf); y=y.astype(np.float32)/32768
+                M = ut.extract_logmel(y, sr,
+                                      AUDIO["n_fft"], AUDIO["hop_length"], AUDIO["n_mels"])
+                W = ut.make_windows(M, AUDIO["context"])
                 with torch.no_grad():
-                    e=((ae(torch.from_numpy(W).to(device))-torch.from_numpy(W).to(device))**2
-                       ).mean(1).cpu().numpy().mean()
+                    e = ((ae(torch.from_numpy(W).to(device))-torch.from_numpy(W).to(device))**2
+                         ).mean(1).mean().item()
                 sf.write(f"{os.path.basename(wf)},{e:.6f}\n")
                 df.write(f"{os.path.basename(wf)},{int(e>thr)}\n")
-        print("  ↪ wrote", os.path.basename(score_csv))
+        print("✓ wrote CSVs for", machine)
 
-    # -------------------------------------------------
-    # 3) Package submission
-    # -------------------------------------------------
-    meta   = f"meta/{label}.meta.yaml"               # you create manually
-    report = f"reports/{label}.technical_report.pdf" # you create manually
-    assert os.path.exists(meta) and os.path.exists(report), \
-        "Place meta YAML in meta/ and PDF in reports/ before zipping."
+    print("\nAll machines done → results in", out_root)
 
-    sub_dir = f"task2/{label}"
-    with zipfile.ZipFile("submission.zip","w",zipfile.ZIP_DEFLATED) as zf:
-        zf.write(report,               arcname=f"task2/{pathlib.Path(report).name}")
-        zf.write(meta,                 arcname=f"{sub_dir}/{pathlib.Path(meta).name}")
-        for csv in glob.glob(f"{out_root}/*.csv"):
-            zf.write(csv, arcname=f"{sub_dir}/{os.path.basename(csv)}")
-    print("\nBuilt submission.zip ✅  ->  ready for upload.")
-
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
