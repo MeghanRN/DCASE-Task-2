@@ -19,15 +19,19 @@ def gamma_threshold(errs, p):
     return st.gamma.ppf(p, shape, loc=loc, scale=scale)
 
 def dataset_windows(wav_files):
-    xs=[]
+    xs = []
     for wf in wav_files:
-        sr,y = wav.read(wf); y=y.astype(np.float32)/32768
-        M    = ut.extract_logmel(y, sr,
-                                 AUDIO["n_fft"],
-                                 AUDIO["hop_length"],
-                                 AUDIO["n_mels"])
+        # Let extract_logmel load the .wav itself
+        M = ut.extract_logmel(
+            wf,                            # filepath
+            sr=AUDIO["sample_rate"],       # sampling rate
+            n_fft=AUDIO["n_fft"],
+            hop_length=AUDIO["hop_length"],
+            n_mels=AUDIO["n_mels"]
+        )
         xs.append(ut.make_windows(M, AUDIO["context"]))
-    return np.concatenate(xs,0)
+    # concatenate all windows into one array
+    return np.concatenate(xs, axis=0)
 
 # ------------ model --------------------
 class AE(nn.Module):
