@@ -2,48 +2,49 @@
 """
 finetune_and_devmetrics.py
 -------------------------
-Fine‑tune a pretrained auto‑encoder on each machine’s **ADD‑TRAIN** normals (or
-fallback to the DEV train normals if no ADD‑TRAIN exists), run inference on the
-DEV test clips, compute AUC / pAUC / PRF metrics, and print a ready‑to‑paste
-YAML snippet for the meta file.
+Fine‑tune a pretrained auto‑encoder on each machine’s **ADD‑TRAIN** normals
+(or fall back to the DEV‑train normals if no ADD‑TRAIN exists), run inference
+on the DEV test clips, compute AUC / pAUC / precision/recall/F1 metrics, and
+print a ready‑to‑paste YAML snippet for your meta file.
 
 Key features
 ~~~~~~~~~~~~
-* Skips machines gracefully when no training or test data exist.
+* Graceful skips when a machine has no training or test data.
 * Guards against Float↔Double dtype mismatches.
 * Robust percentile threshold with fallback to `threshold.percentile`.
-* CSVs include headers for easier ad‑hoc inspection.
+* CSVs include headers for quick spreadsheet inspection.
 """
 
 from __future__ import annotations
 
-import os
 import glob
 import math
+import os
 import pathlib
-import yaml
-import numpy as np
-from tqdm import tqdm
+from typing import List
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import yaml
+from scipy.stats import gamma
 from sklearn.metrics import (
+    precision_recall_fscore_support,
     roc_auc_score,
     roc_curve,
-    precision_recall_fscore_support,
 )
-from scipy.stats import gamma
+from tqdm import tqdm
 
 from utils import extract_logmel, make_windows
 
-# ----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Model definition
-# ----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 
 class AE(nn.Module):
-    """Symmetric three‑layer encoder/decoder MLP auto‑encoder."""
+    """Simple symmetric MLP auto‑encoder."""
 
     def __init__(self, dim: int, hidden: int, bottleneck: int) -> None:
         super().__init__()
@@ -62,9 +63,9 @@ class AE(nn.Module):
         return self.dec(self.enc(x))
 
 
-# ----------------------------------------------------------------------------
-# Utility helpers
-# ----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Helper functions
+# -----------------------------------------------------------------------------
 
 def load_cfg(path: str = "config.yaml") -> dict:
     return yaml.safe_load(open(path, "r"))
@@ -80,11 +81,11 @@ def get_device(preference: str = "auto") -> torch.device:
     return torch.device(preference)
 
 
-def windows_from_wavs(files: list[str], audio_cfg: dict) -> np.ndarray:
+def windows_from_wavs(files: List[str], audio_cfg: dict) -> np.ndarray:
     """Load WAVs, build context‑window log‑mel feature matrix."""
     if not files:
         raise ValueError("windows_from_wavs called with an empty file list")
-    all_windows: list[np.ndarray] = []
+    all_windows: List[np.ndarray] = []
     for wav_path in files:
         mel = extract_logmel(
             wav_path,
@@ -98,13 +99,14 @@ def windows_from_wavs(files: list[str], audio_cfg: dict) -> np.ndarray:
 
 
 def gamma_threshold(errors: np.ndarray, percentile: float) -> float:
+    """Gamma‑fit percentile threshold."""
     shape, loc, scale = gamma.fit(errors, floc=0)
     return float(gamma.ppf(percentile / 100.0, shape, loc=loc, scale=scale))
 
 
-# ----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Main pipeline
-# ----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 
 def main() -> None:
     cfg = load_cfg()
@@ -119,7 +121,7 @@ def main() -> None:
     out_root = pathlib.Path("dev_results")
     out_root.mkdir(parents=True, exist_ok=True)
 
-    # ── pretrained weights ──────────────────────────────────────────────
+    # ── pretrained weights ─────────────────────────────────────────────
     weights_path = pathlib.Path(cfg["paths"]["pretrained_dir"]) / "ae_dev.pt"
     if not weights_path.exists():
         raise FileNotFoundError("Pretrained weights not found – run pretrain_dev.py first.")
@@ -127,7 +129,7 @@ def main() -> None:
     device = get_device(cfg.get("device", "auto"))
     print("Device:", device)
 
-    yaml_lines: list[str] = ["  development_dataset:"]
+    yaml_lines: List[str] = ["  development_dataset:"]
 
     machines = sorted([d.name for d in dev_root.iterdir() if d.is_dir()])
     for machine in machines:
@@ -168,8 +170,8 @@ def main() -> None:
 
         # ---------------- threshold --------------------------
         with torch.no_grad():
-            errs = []
             ae.eval()
+            errs = []
             for batch in loader:
                 batch = batch.to(device, dtype=torch.float32)
                 errs.append(((ae(batch) - batch) ** 2).mean(1).cpu().numpy())
@@ -219,7 +221,14 @@ def main() -> None:
         domains_np = np.array(domains)
 
         def auc_for(dom: str) -> float:
-            m = domains_np == dom
-            if not m.any() or y_true_np[m].sum() == 0:
+            mask = domains_np == dom
+            if not mask.any() or y_true_np[mask].sum() == 0:
                 return float("nan")
-            return roc_auc_score(y_true_np[m], y_score_np
+            return roc_auc_score(y_true_np[mask], y_score_np[mask]) * 100
+
+        auc_src = auc_for("source")
+        auc_tgt = auc_for("target")
+
+        fpr, tpr, _ = roc_curve(y_true_np, y_score_np)
+        pauc_mask = fpr <= 0.1
+        pauc = (np.trapz(tpr[p
