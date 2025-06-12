@@ -4,7 +4,7 @@ paths:
   eval_root:       data/dcase2025t2/eval_data/raw           # 8-machine “additional train + eval test” set
   pretrained_dir:  pretrained                                # where pre-train model is saved
   out_root:        outputs/task2/MeghanKret_Cooper_task2_1   # CSVs & later submission.zip
-
+  dev_results:     outputs/task2/dev_results
 # ------------------- AUDIO FEATS -------------
 audio:
   sample_rate: 16000
