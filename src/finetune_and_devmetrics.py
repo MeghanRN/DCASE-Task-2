@@ -2,26 +2,22 @@
 """
 finetune_and_devmetrics.py
 -------------------------
-Fine‑tune a pretrained auto‑encoder on each machine’s **ADD‑TRAIN** normals,
-run inference on the **DEV** test clips, compute AUC / pAUC / PRF metrics, and
-print a ready‑to‑paste YAML snippet for the meta file.
+Fine‑tune a pretrained auto‑encoder on each machine’s **ADD‑TRAIN** normals (or
+fallback to the DEV train normals if no ADD‑TRAIN exists), run inference on the
+DEV test clips, compute AUC / pAUC / PRF metrics, and print a ready‑to‑paste
+YAML snippet for the meta file.
 
-✔ **Bug‑fixed**
-  • Path/array mismatch removed – `extract_logmel` now gets a filepath.
-  • Guaranteed `float32` tensors throughout to avoid Float/Double errors.
-  • Robust threshold lookup with a fallback if `train.gamma_percentile` is
-    missing (uses `threshold.percentile`).
-  • CSVs now include headers for convenience.
-
-⚙️ **Config mapping**
-  - Uses `cfg["audio"]`, `cfg["train"]`, and `cfg["model"]` exactly as your
-    YAML defines them (no more hard‑coded defaults).
-  - The script will raise a clear error if the pretrained weights are absent.
-
-📈 **Metrics**: source vs target AUC, pAUC@0.1 FPR, and per‑domain
-precision/recall/F1. Everything is collected into `dev_results/` and then
-summarised in YAML.
+Key changes
+~~~~~~~~~~~
+* **Empty‑directory guard** – if no WAVs are found in `eval_root/<machine>/train`,
+  the script automatically falls back to `dev_root/<machine>/train`. If that is
+  also empty, the machine is skipped with a warning rather than crashing.
+* All tensors are cast to `float32`.
+* CSV headers added.
+* Threshold percentile key fallback (`train.gamma_percentile` ➔ `threshold.percentile`).
 """
+
+from __future__ import annotations
 
 import os
 import glob
@@ -43,10 +39,11 @@ from utils import extract_logmel, make_windows
 # Model definition
 # -----------------------------------------------------------------------------
 
-class AE(nn.Module):
-    """Symmetric 3‑layer encoder/decoder MLP auto‑encoder."""
 
-    def __init__(self, dim: int, hidden: int, bottleneck: int):
+class AE(nn.Module):
+    """Symmetric three‑layer encoder/decoder MLP auto‑encoder."""
+
+    def __init__(self, dim: int, hidden: int, bottleneck: int) -> None:
         super().__init__()
         self.enc = nn.Sequential(
             nn.Linear(dim, hidden), nn.BatchNorm1d(hidden), nn.ReLU(),
@@ -71,22 +68,24 @@ def load_cfg(path: str = "config.yaml") -> dict:
     return yaml.safe_load(open(path, "r"))
 
 
-def get_device(pref: str = "auto") -> torch.device:
-    if pref == "auto":
+def get_device(preference: str = "auto") -> torch.device:
+    if preference == "auto":
         if torch.cuda.is_available():
             return torch.device("cuda")
         if torch.backends.mps.is_available():
             return torch.device("mps")
         return torch.device("cpu")
-    return torch.device(pref)
+    return torch.device(preference)
 
 
 def windows_from_wavs(files: list[str], audio_cfg: dict) -> np.ndarray:
-    """Load every *.wav file, convert to context‑windowed log‑mels, concatenate."""
-    all_windows = []
-    for f in files:
+    """Load WAVs, build context‑window log‑mel feature matrix."""
+    if not files:
+        raise ValueError("windows_from_wavs called with an empty file list")
+    all_windows: list[np.ndarray] = []
+    for wav_path in files:
         mel = extract_logmel(
-            f,
+            wav_path,
             sr=audio_cfg["sample_rate"],
             n_fft=audio_cfg["n_fft"],
             hop_length=audio_cfg["hop_length"],
@@ -97,7 +96,6 @@ def windows_from_wavs(files: list[str], audio_cfg: dict) -> np.ndarray:
 
 
 def gamma_threshold(errors: np.ndarray, percentile: float) -> float:
-    """Return the Gamma‑fit percentile threshold."""
     shape, loc, scale = gamma.fit(errors, floc=0)
     return float(gamma.ppf(percentile / 100.0, shape, loc=loc, scale=scale))
 
@@ -112,12 +110,11 @@ def main() -> None:
     train_cfg = cfg["train"]
     model_cfg = cfg["model"]
 
-    D = audio_cfg["n_mels"] * audio_cfg["context"]
+    dim = audio_cfg["n_mels"] * audio_cfg["context"]
 
     dev_root = pathlib.Path(cfg["paths"]["dev_root"])
     eval_root = pathlib.Path(cfg["paths"]["eval_root"])
-    out_root = pathlib.Path("dev_results")
-    out_root.mkdir(parents=True, exist_ok=True)
+    out_root = pathlib.Path("dev_results"); out_root.mkdir(parents=True, exist_ok=True)
 
     # ── pretrained weights ──────────────────────────────────────────────
     weights_path = pathlib.Path(cfg["paths"]["pretrained_dir"]) / "ae_dev.pt"
@@ -127,18 +124,27 @@ def main() -> None:
     device = get_device(cfg.get("device", "auto"))
     print("Device:", device)
 
-    yaml_lines = ["  development_dataset:"]
+    yaml_lines: list[str] = ["  development_dataset:"]
 
     machines = sorted([d.name for d in dev_root.iterdir() if d.is_dir()])
     for machine in machines:
         print(f"\n=== {machine} ===")
 
-        # ---------------- model init ----------------
-        ae = AE(D, model_cfg["hidden"], model_cfg["bottleneck"]).to(device)
+        # ---------------- gather training WAVs ----------------
+        train_wavs = glob.glob(str(eval_root / machine / "train" / "**" / "*.wav"), recursive=True)
+        if not train_wavs:
+            train_wavs = glob.glob(str(dev_root / machine / "train" / "**" / "*.wav"), recursive=True)
+            if train_wavs:
+                print("  ↳ no ADD‑TRAIN found, using DEV train normals instead")
+        if not train_wavs:
+            print(f"  ↳ no training data for {machine}; skipping machine.")
+            continue
+
+        # ---------------- model init --------------------------
+        ae = AE(dim, model_cfg["hidden"], model_cfg["bottleneck"]).to(device)
         ae.load_state_dict(torch.load(weights_path, map_location=device))
 
-        # ---------------- fine‑tune ------------------
-        train_wavs = glob.glob(str(eval_root / machine / "train" / "**" / "*.wav"), recursive=True)
+        # ---------------- fine‑tune ---------------------------
         X = windows_from_wavs(train_wavs, audio_cfg)
         loader = torch.utils.data.DataLoader(
             torch.from_numpy(X),
@@ -150,17 +156,17 @@ def main() -> None:
         opt = optim.Adam(ae.parameters(), lr=train_cfg["lr"])
         ae.train()
         for epoch in range(train_cfg["epochs_finetune"]):
-            pbar = tqdm(loader, desc=f"FT {machine} {epoch+1}/{train_cfg['epochs_finetune']}", leave=False)
+            pbar = tqdm(loader, desc=f"FT {machine} {epoch + 1}/{train_cfg['epochs_finetune']}", leave=False)
             for batch in pbar:
                 batch = batch.to(device, dtype=torch.float32)
                 loss = ((ae(batch) - batch) ** 2).mean()
                 opt.zero_grad(); loss.backward(); opt.step()
                 pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-        # ---------------- threshold ------------------
+        # ---------------- threshold --------------------------
         with torch.no_grad():
-            ae.eval()
             errs = []
+            ae.eval()
             for batch in loader:
                 batch = batch.to(device, dtype=torch.float32)
                 errs.append(((ae(batch) - batch) ** 2).mean(1).cpu().numpy())
@@ -168,10 +174,13 @@ def main() -> None:
         thr = gamma_threshold(np.concatenate(errs), gamma_pct)
         print(f"threshold={thr:.3f}")
 
-        # ---------------- inference ------------------
+        # ---------------- inference --------------------------
         test_wavs = sorted(glob.glob(str(dev_root / machine / "test" / "*.wav")))
-        y_true, y_score, domains = [], [], []
+        if not test_wavs:
+            print(f"  ↳ no DEV test clips for {machine}; skipping.")
+            continue
 
+        y_true, y_score, domains = [], [], []
         score_csv = out_root / f"anomaly_score_{machine}_section_00_test.csv"
         decide_csv = out_root / f"decision_result_{machine}_section_00_test.csv"
         with score_csv.open("w") as sf, decide_csv.open("w") as df:
@@ -201,33 +210,35 @@ def main() -> None:
                 y_score.append(err)
                 domains.append(domain)
 
-        # ---------------- metrics --------------------
-        y_true = np.array(y_true);
-        y_score = np.array(y_score);
-        domains = np.array(domains)
+        # ---------------- metrics ----------------------------
+        y_true_np = np.array(y_true)
+        y_score_np = np.array(y_score)
+        domains_np = np.array(domains)
 
-        def auc_domain(dom):
-            mask = domains == dom
-            return roc_auc_score(y_true[mask], y_score[mask]) * 100 if mask.any() and y_true[mask].sum() else math.nan
+        def auc_for(dom: str) -> float:
+            m = domains_np == dom
+            if not m.any() or y_true_np[m].sum() == 0:
+                return float("nan")
+            return roc_auc_score(y_true_np[m], y_score_np[m]) * 100
 
-        auc_src = auc_domain("source")
-        auc_tgt = auc_domain("target")
+        auc_src = auc_for("source")
+        auc_tgt = auc_for("target")
 
-        fpr, tpr, _ = roc_curve(y_true, y_score)
+        fpr, tpr, _ = roc_curve(y_true_np, y_score_np)
         mask = fpr <= 0.1
-        pauc = (np.trapz(tpr[mask], fpr[mask]) / 0.1) * 100
+        pauc = np.trapz(tpr[mask], fpr[mask]) / 0.1 * 100
 
-        y_pred = (y_score > thr).astype(int)
-        prec, rec, f1, _ = precision_recall_fscore_support(y_true, y_pred, pos_label=1, average="binary")
+        y_pred = (y_score_np > thr).astype(int)
+        prec, rec, f1, _ = precision_recall_fscore_support(y_true_np, y_pred, pos_label=1, average="binary")
 
-        def prf(dom):
-            m = domains == dom
-            return precision_recall_fscore_support(y_true[m], y_pred[m], pos_label=1, average="binary", zero_division=0)
+        def prf(dom: str):
+            m = domains_np == dom
+            return precision_recall_fscore_support(y_true_np[m], y_pred[m], pos_label=1, average="binary", zero_division=0)
 
         pr_src = prf("source")
         pr_tgt = prf("target")
 
-        # ---------------- YAML lines -----------------
+        # ---------------- YAML lines -------------------------
         yaml_lines.extend([
             f"    {machine}:",
             f"      auc_source: {auc_src:.2f}",
@@ -236,18 +247,4 @@ def main() -> None:
             f"      precision_source: {pr_src[0]:.3f}",
             f"      precision_target: {pr_tgt[0]:.3f}",
             f"      recall_source: {pr_src[1]:.3f}",
-            f"      recall_target: {pr_tgt[1]:.3f}",
-            f"      f1_source: {pr_src[2]:.3f}",
-            f"      f1_target: {pr_tgt[2]:.3f}",
-        ])
-
-        print(f"→ completed {machine}")
-
-    # -----------------------------------------------------------------
-    print("\n\n==== YAML block for meta file ====")
-    print("\n".join(yaml_lines))
-    print("==================================")
-
-
-if __name__ == "__main__":
-    main()
+            f"      recall_target:
