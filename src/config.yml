@@ -1,18 +1,37 @@
-data:
-  dev_dir:  "data/dcase2025t2/dev_data/raw"
-  eval_dir: "data/dcase2025t2/eval_data/raw"
+# ------------------------------------------
+# Global paths
+# ------------------------------------------
+paths:
+  dev_root:  data/dcase2025t2/dev_data/raw
+  eval_root: data/dcase2025t2/eval_data/raw
+  out_root:  outputs/task2/Kret_CU_task2_1      # <— change label here
+  pretrained_dir: outputs/task2/pretrained      # holds dev pre-train weights
 
-audio:
-  sample_rate: 16000
-  n_fft:       1024
-  hop_length:  512
-  n_mels:      128
-  context:     5
+# ------------------------------------------
+# Feature extraction
+# ------------------------------------------
+feature:
+  sr:            16000
+  n_mels:        128
+  win_length_ms: 64
+  hop_length_ms: 32
+  context:       5          # frames to stack (P)
 
+# ------------------------------------------
+# Model
+# ------------------------------------------
+model:
+  hidden: 128
+  bottleneck: 8
+
+# ------------------------------------------
+# Train / fine-tune
+# ------------------------------------------
 train:
-  batch_size: 64
-  lr:         0.001
-  epochs:     1 
+  epochs_pretrain: 30
+  epochs_finetune: 20
+  batch_size:      256
+  lr:              0.001
+  gamma_percentile: 0.90      # threshold
 
-threshold:
-  percentile: 90
+device: auto                     # "auto"=cuda|mps|cpu
