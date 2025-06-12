@@ -1,0 +1,18 @@
+data:
+  dev_dir:  "data/dcase2025t2/dev_data/raw"
+  eval_dir: "data/dcase2025t2/eval_data/raw"
+
+audio:
+  sample_rate: 16000
+  n_fft:       1024
+  hop_length:  512
+  n_mels:      128
+  context:     5
+
+train:
+  batch_size: 64
+  lr:         0.001
+  epochs:     1 
+
+threshold:
+  percentile: 90
