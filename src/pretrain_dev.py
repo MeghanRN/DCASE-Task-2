@@ -1,126 +1,69 @@
 #!/usr/bin/env python3
 # ------------------------------------------------------------
-# pretrain_dev.py
-# Pre-trains an AE on *all normal* dev-set windows and
-# stores the weights + reconstruction-error histogram +
-# a Gamma-percentile threshold.
+# Pre-train one AE on *all* dev-set normals (domain-agnostic)
 # ------------------------------------------------------------
-import os, glob, yaml, pathlib, numpy as np, torch
+import os, glob, torch, numpy as np
 import torch.nn as nn
-from torch.utils.data import DataLoader, IterableDataset
+from torch.utils.data import IterableDataset, DataLoader
 from tqdm import tqdm
-from utils import extract_logmel, make_windows, fit_gamma_threshold   # your utils.py
+import utils as ut
 
-# ----------------- config helpers ---------------------------
-def load_cfg(path="config.yaml"):
-    return yaml.safe_load(open(path, "r"))
+cfg = ut.load_config()
+AUDIO, TRAIN = cfg["audio"], cfg["train"]
 
-def get_device(cfg):
-    if cfg.get("device", "auto") == "auto":
-        return torch.device("cuda" if torch.cuda.is_available()
-                            else "mps" if torch.backends.mps.is_available()
-                            else "cpu")
-    return torch.device(cfg["device"])
-
-# ----------------- dataset ----------------------------------
+# -------- dataset -------------------------------------------------
 class DevWindows(IterableDataset):
-    """
-    Streams *all* context-windows (640-D) from every
-    <machine>/train/*.wav in dev_root.
-    """
-    def __init__(self, dev_root, cfg):
-        self.wavs = glob.glob(f"{dev_root}/*/train/*.wav")
-        self.cfg  = cfg
+    def __init__(self, root):
+        self.wavs = glob.glob(f"{root}/*/train/*.wav")
 
     def __iter__(self):
-        for wav_f in self.wavs:
-            y, sr = _read_wav(wav_f)
-            M = extract_logmel(
-                    y, sr,
-                    n_fft      = self.cfg["feature"]["n_fft"],
-                    hop_length = self.cfg["feature"]["hop_length"],
-                    n_mels     = self.cfg["feature"]["n_mels"])
-            W = make_windows(M, self.cfg["feature"]["context"])
-            for w in W:
-                yield torch.from_numpy(w).float()
+        for wf in self.wavs:
+            y, sr = ut.librosa.load(wf, sr=AUDIO["sample_rate"])
+            M = ut.extract_logmel(y, sr,
+                                  AUDIO["n_fft"],
+                                  AUDIO["hop_length"],
+                                  AUDIO["n_mels"])
+            for w in ut.make_windows(M, AUDIO["context"]):
+                yield torch.from_numpy(w)
 
-def _read_wav(path):
-    import scipy.io.wavfile as wav
-    sr, y = wav.read(path)
-    return (y.astype(np.float32)/32768.0, sr)
-
-# ----------------- model ------------------------------------
-class AutoEncoder(nn.Module):
-    def __init__(self, D, h=128, b=8):
+# -------- model ---------------------------------------------------
+class AE(nn.Module):
+    def __init__(self, D, H=cfg["model"]["hidden"], B=cfg["model"]["bottleneck"]):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(D, h), nn.BatchNorm1d(h), nn.ReLU(),
-            nn.Linear(h, h), nn.BatchNorm1d(h), nn.ReLU(),
-            nn.Linear(h, h), nn.BatchNorm1d(h), nn.ReLU(),
-            nn.Linear(h, b), nn.BatchNorm1d(b), nn.ReLU(),
-            nn.Linear(b, h), nn.BatchNorm1d(h), nn.ReLU(),
-            nn.Linear(h, h), nn.BatchNorm1d(h), nn.ReLU(),
-            nn.Linear(h, h), nn.BatchNorm1d(h), nn.ReLU(),
-            nn.Linear(h, D)
-        )
-    def forward(self, x): return self.net(x)
+        self.enc = nn.Sequential(
+            nn.Linear(D, H), nn.BatchNorm1d(H), nn.ReLU(),
+            nn.Linear(H, H), nn.BatchNorm1d(H), nn.ReLU(),
+            nn.Linear(H, B), nn.BatchNorm1d(B), nn.ReLU())
+        self.dec = nn.Sequential(
+            nn.Linear(B, H), nn.BatchNorm1d(H), nn.ReLU(),
+            nn.Linear(H, H), nn.BatchNorm1d(H), nn.ReLU(),
+            nn.Linear(H, D))
+    def forward(self,x): return self.dec(self.enc(x))
 
-# ----------------- main -------------------------------------
-def main():
-    cfg      = load_cfg()
-    dev_root = cfg["paths"]["dev_root"]     # <-- SAME KEY AS finetune_and_infer.py
-    out_dir  = pathlib.Path(cfg["paths"]["pretrained_dir"])
-    out_dir.mkdir(parents=True, exist_ok=True)
+# -------- training ------------------------------------------------
+device = (torch.device("cuda") if torch.cuda.is_available()
+          else torch.device("mps") if torch.backends.mps.is_available()
+          else torch.device("cpu"))
+print("Device:", device)
 
-    D = cfg["feature"]["n_mels"] * cfg["feature"]["context"]
-    device = get_device(cfg)
-    print("Device:", device)
+dataset = DevWindows(cfg["paths"]["dev_root"])
+loader  = DataLoader(dataset, batch_size=TRAIN["batch_size"],
+                     shuffle=False, num_workers=2)
 
-    # dataset & loader -------------------------------------------------
-    ds      = DevWindows(dev_root, cfg)
-    loader  = DataLoader(ds,
-                         batch_size = cfg["train"]["batch_size"],
-                         shuffle    = False,
-                         num_workers=2)
-    ae      = AutoEncoder(D,
-                          h = cfg["model"]["hidden"],
-                          b = cfg["model"]["bottleneck"]).to(device)
-    opt     = torch.optim.Adam(ae.parameters(), lr=cfg["train"]["lr"])
-    mse     = nn.MSELoss()
+D = AUDIO["n_mels"] * AUDIO["context"]
+model = AE(D).to(device)
+opt   = torch.optim.Adam(model.parameters(), lr=TRAIN["lr"])
+lossf = nn.MSELoss()
 
-    # training ---------------------------------------------------------
-    n_epochs = cfg["train"]["epochs_pretrain"]
-    print(f"Pre-training for {n_epochs} epoch(s) …")
-    for ep in range(n_epochs):
-        bar = tqdm(loader, desc=f"Epoch {ep+1}/{n_epochs}")
-        for batch in bar:
-            batch = batch.to(device)
-            opt.zero_grad()
-            loss = mse(ae(batch), batch)
-            loss.backward()
-            opt.step()
-            bar.set_postfix(loss=loss.item())
+print("Pre-training …")
+for ep in range(TRAIN["epochs_pretrain"]):
+    bar = tqdm(loader, desc=f"Epoch {ep+1}/{TRAIN['epochs_pretrain']}")
+    for batch in bar:
+        batch = batch.to(device, dtype=torch.float32)
+        loss  = lossf(model(batch), batch)
+        opt.zero_grad(); loss.backward(); opt.step()
+        bar.set_postfix(loss=f"{loss.item():.4f}")
 
-    # collect reconstruction errors -----------------------------------
-    print("Collecting reconstruction errors …")
-    errs = []
-    ae.eval()
-    with torch.no_grad():
-        for batch in loader:
-            batch = batch.to(device)
-            e = torch.mean((ae(batch)-batch)**2, dim=1).cpu().numpy()
-            errs.append(e)
-    errs = np.concatenate(errs)
-
-    thr = fit_gamma_threshold(errs, cfg["threshold"]["percentile"])
-    print(f"Gamma {cfg['threshold']['percentile']}-th percentile threshold = {thr:.6f}")
-
-    # save -------------------------------------------------------------
-    torch.save(ae.state_dict(), out_dir / "ae_dev.pt")
-    np.save(out_dir / "dev_errors.npy", errs)
-    with open(out_dir / "threshold.txt", "w") as f:
-        f.write(f"{thr:.9f}")
-    print("✔  Saved weights + errors + threshold to", out_dir)
-
-if __name__ == "__main__":
-    main()
+os.makedirs(cfg["paths"]["pretrained_dir"], exist_ok=True)
+torch.save(model.state_dict(), f"{cfg['paths']['pretrained_dir']}/ae_dev.pt")
+print("✓ saved pretrained/ae_dev.pt")
